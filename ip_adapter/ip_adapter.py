@@ -125,16 +125,21 @@ class IPAdapter:
                 self.pipe.controlnet.set_attn_processor(CNAttnProcessor(num_tokens=self.num_tokens))
 
     def load_ip_adapter(self):
+        state_dict = {"image_proj": {}, "ip_adapter": {}}
         if os.path.splitext(self.ip_ckpt)[-1] == ".safetensors":
-            state_dict = {"image_proj": {}, "ip_adapter": {}}
             with safe_open(self.ip_ckpt, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    if key.startswith("image_proj_model."):
-                        state_dict["image_proj"][key.replace("image_proj_model.", "")] = f.get_tensor(key)
+                    if key.startswith("image_proj."):
+                        state_dict["image_proj"][key.replace("image_proj.", "")] = f.get_tensor(key)
                     elif key.startswith("ip_adapter."):
                         state_dict["ip_adapter"][key.replace("ip_adapter.", "")] = f.get_tensor(key)
         else:
-            state_dict = torch.load(self.ip_ckpt, map_location="cpu")
+            f = torch.load(self.ip_ckpt, map_location="cpu")
+            for key in f.keys():
+                if key.startswith("image_proj_model."):
+                    state_dict["image_proj"][key.replace("image_proj_model.", "")] = f[key]
+                elif key.startswith("adapter_modules."):
+                    state_dict["ip_adapter"][key.replace("adapter_modules.", "")] = f[key]
         self.image_proj_model.load_state_dict(state_dict["image_proj"])
         ip_layers = torch.nn.ModuleList(self.pipe.unet.attn_processors.values())
         ip_layers.load_state_dict(state_dict["ip_adapter"])
@@ -197,13 +202,14 @@ class IPAdapter:
         uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
 
         with torch.inference_mode():
-            prompt_embeds_, negative_prompt_embeds_ = self.pipe.encode_prompt(
+            all_prompt_embeds = self.pipe._encode_prompt(
                 prompt,
                 device=self.device,
                 num_images_per_prompt=num_samples,
                 do_classifier_free_guidance=True,
                 negative_prompt=negative_prompt,
             )
+            prompt_embeds_, negative_prompt_embeds_ = all_prompt_embeds[:num_samples, :, :], all_prompt_embeds[num_samples:, :, :]
             prompt_embeds = torch.cat([prompt_embeds_, image_prompt_embeds], dim=1)
             negative_prompt_embeds = torch.cat([negative_prompt_embeds_, uncond_image_prompt_embeds], dim=1)
 
@@ -216,7 +222,7 @@ class IPAdapter:
             num_inference_steps=num_inference_steps,
             generator=generator,
             **kwargs,
-        ).images
+        )
 
         return images
 

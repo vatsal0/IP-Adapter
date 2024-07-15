@@ -414,9 +414,8 @@ def main():
             global_step += 1
             
             if global_step % args.save_steps == 0:
-                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                accelerator.get_state_dict(ip_adapter)
-                accelerator.save_state(save_path)
+                save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.bin")
+                torch.save(accelerator.unwrap_model(ip_adapter).state_dict(), save_path) # TODO don't save unet tensors
             
             begin = time.perf_counter()
                 
