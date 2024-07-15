@@ -95,6 +95,9 @@ class IPAdapter:
         unet = self.pipe.unet
         attn_procs = {}
         for name in unet.attn_processors.keys():
+            if 'temp' in name or name.startswith("transformer_in"):
+                continue
+            
             cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
             if name.startswith("mid_block"):
                 hidden_size = unet.config.block_out_channels[-1]
@@ -113,7 +116,7 @@ class IPAdapter:
                     scale=1.0,
                     num_tokens=self.num_tokens,
                 ).to(self.device, dtype=torch.float16)
-        unet.set_attn_processor(attn_procs)
+        unet.set_attn_processor(attn_procs, partial=True)
         if hasattr(self.pipe, "controlnet"):
             if isinstance(self.pipe.controlnet, MultiControlNetModel):
                 for controlnet in self.pipe.controlnet.nets:
@@ -126,8 +129,8 @@ class IPAdapter:
             state_dict = {"image_proj": {}, "ip_adapter": {}}
             with safe_open(self.ip_ckpt, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    if key.startswith("image_proj."):
-                        state_dict["image_proj"][key.replace("image_proj.", "")] = f.get_tensor(key)
+                    if key.startswith("image_proj_model."):
+                        state_dict["image_proj"][key.replace("image_proj_model.", "")] = f.get_tensor(key)
                     elif key.startswith("ip_adapter."):
                         state_dict["ip_adapter"][key.replace("ip_adapter.", "")] = f.get_tensor(key)
         else:

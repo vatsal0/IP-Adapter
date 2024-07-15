@@ -1,0 +1,3 @@
+diffusers
+wandb/
+ip_adapter/__pycache__/

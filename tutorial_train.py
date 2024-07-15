@@ -14,7 +14,7 @@ from transformers import CLIPImageProcessor
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, UNet3DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 from ip_adapter.ip_adapter import ImageProjModel
@@ -24,21 +24,24 @@ if is_torch2_available():
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
+import torchvision
+from ipdb import set_trace
 
 # Dataset
 class MyDataset(torch.utils.data.Dataset):
 
-    def __init__(self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path=""):
+    def __init__(self, args, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05):
         super().__init__()
+        video, audio, fps = torchvision.io.read_video(args.data_video_file, pts_unit='sec')
+        self.video = video
+        self.prompt = args.prompt
+        self.num_frames = args.num_frames
 
         self.tokenizer = tokenizer
         self.size = size
         self.i_drop_rate = i_drop_rate
         self.t_drop_rate = t_drop_rate
         self.ti_drop_rate = ti_drop_rate
-        self.image_root_path = image_root_path
-
-        self.data = json.load(open(json_file)) # list of dict: [{"image_file": "1.png", "text": "A dog"}]
 
         self.transform = transforms.Compose([
             transforms.Resize(self.size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -49,12 +52,10 @@ class MyDataset(torch.utils.data.Dataset):
         self.clip_image_processor = CLIPImageProcessor()
         
     def __getitem__(self, idx):
-        item = self.data[idx] 
-        text = item["text"]
-        image_file = item["image_file"]
-        
+        text = self.prompt
+
         # read image
-        raw_image = Image.open(os.path.join(self.image_root_path, image_file))
+        raw_image = torchvision.transforms.functional.to_pil_image(self.video[int(self.video.shape[0] * idx / self.num_frames)].permute(2, 0, 1))
         image = self.transform(raw_image.convert("RGB"))
         clip_image = self.clip_image_processor(images=raw_image, return_tensors="pt").pixel_values
         
@@ -85,7 +86,7 @@ class MyDataset(torch.utils.data.Dataset):
         }
 
     def __len__(self):
-        return len(self.data)
+        return self.num_frames # FIXME
     
 
 def collate_fn(data):
@@ -159,18 +160,11 @@ def parse_args():
         help="Path to pretrained ip adapter model. If not specified weights are initialized randomly.",
     )
     parser.add_argument(
-        "--data_json_file",
+        "--data_video_file",
         type=str,
         default=None,
         required=True,
         help="Training data",
-    )
-    parser.add_argument(
-        "--data_root_path",
-        type=str,
-        default="",
-        required=True,
-        help="Training data root path",
     )
     parser.add_argument(
         "--image_encoder_path",
@@ -214,6 +208,9 @@ def parse_args():
         "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
+        "--num_frames", type=int, default=16, help=""
+    )
+    parser.add_argument(
         "--dataloader_num_workers",
         type=int,
         default=0,
@@ -249,6 +246,7 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
+    parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     
     args = parser.parse_args()
@@ -280,7 +278,7 @@ def main():
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    unet = UNet3DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
@@ -298,6 +296,9 @@ def main():
     attn_procs = {}
     unet_sd = unet.state_dict()
     for name in unet.attn_processors.keys():
+        if 'temp' in name or name.startswith("transformer_in"):
+            continue
+        
         cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
         if name.startswith("mid_block"):
             hidden_size = unet.config.block_out_channels[-1]
@@ -317,7 +318,7 @@ def main():
             }
             attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
             attn_procs[name].load_state_dict(weights)
-    unet.set_attn_processor(attn_procs)
+    unet.set_attn_processor(attn_procs, partial=True)
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     
     ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
@@ -337,7 +338,7 @@ def main():
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     
     # dataloader
-    train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path)
+    train_dataset = MyDataset(args, tokenizer=tokenizer, size=args.resolution)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -349,22 +350,29 @@ def main():
     # Prepare everything with our `accelerator`.
     ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
     
+    if accelerator.is_main_process:
+        accelerator.init_trackers("text2video-ip-adapter", config=vars(args))
+
     global_step = 0
+    assert args.train_batch_size == args.num_frames # FIXME
     for epoch in range(0, args.num_train_epochs):
         begin = time.perf_counter()
         for step, batch in enumerate(train_dataloader):
             load_data_time = time.perf_counter() - begin
             with accelerator.accumulate(ip_adapter):
                 # Convert images to latent space
+                batch_size = 1 # FIXME
+
                 with torch.no_grad():
                     latents = vae.encode(batch["images"].to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
                     latents = latents * vae.config.scaling_factor
+                    latents = latents.unsqueeze(0).permute(0,2,1,3,4)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -373,17 +381,20 @@ def main():
             
                 with torch.no_grad():
                     image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
-                image_embeds_ = []
-                for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
-                    if drop_image_embed == 1:
-                        image_embeds_.append(torch.zeros_like(image_embed))
-                    else:
-                        image_embeds_.append(image_embed)
-                image_embeds = torch.stack(image_embeds_)
+                    image_embeds = image_embeds.unsqueeze(0).mean(dim=1)
+                # image_embeds_ = []
+                # for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
+                #     if drop_image_embed == 1:
+                #         image_embeds_.append(torch.zeros_like(image_embed))
+                #     else:
+                #         image_embeds_.append(image_embed)
+                # image_embeds = torch.stack(image_embeds_)
             
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["text_input_ids"].to(accelerator.device))[0]
+                    encoder_hidden_states = encoder_hidden_states.unsqueeze(0).mean(dim=1)
                 
+                # set_trace()
                 noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds)
         
                 loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
@@ -404,6 +415,7 @@ def main():
             
             if global_step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                accelerator.get_state_dict(ip_adapter)
                 accelerator.save_state(save_path)
             
             begin = time.perf_counter()
