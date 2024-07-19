@@ -14,7 +14,7 @@ from transformers import CLIPImageProcessor
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
-from diffusers import AutoencoderKL, DDPMScheduler, UNet3DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, UNet3DConditionModel, DiffusionPipeline
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 from ip_adapter.ip_adapter import ImageProjModel
@@ -24,7 +24,11 @@ if is_torch2_available():
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
+from ip_adapter import IPAdapter as InferenceIPAdapter
+
 import torchvision
+import wandb
+import numpy as np
 from ipdb import set_trace
 
 # Dataset
@@ -114,11 +118,11 @@ class IPAdapter(torch.nn.Module):
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
 
-    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds):
+    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds, bypass_all_temporal=False):
         ip_tokens = self.image_proj_model(image_embeds)
         encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         # Predict the noise residual
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, bypass_all_temporal=bypass_all_temporal).sample
         return noise_pred
 
     def load_from_checkpoint(self, ckpt_path: str):
@@ -259,6 +263,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(args)
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -328,7 +333,7 @@ def main():
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-    #unet.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device)#, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -351,7 +356,13 @@ def main():
     ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
     
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2video-ip-adapter", config=vars(args))
+        accelerator.init_trackers("text2video-ip-adapter", config=vars(args), init_kwargs={"wandb":{"name":os.path.basename(args.output_dir)}})
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            tracker.log({
+                "Reference Video": [wandb.Video(train_dataset.video.permute(0,3,1,2).numpy(), fps=30)]
+            })
 
     global_step = 0
     assert args.train_batch_size == args.num_frames # FIXME
@@ -359,6 +370,56 @@ def main():
         begin = time.perf_counter()
         for step, batch in enumerate(train_dataloader):
             load_data_time = time.perf_counter() - begin
+
+            if global_step % 250 == 0:
+                with torch.no_grad():
+                  pipeline = DiffusionPipeline.from_pretrained(
+                      args.pretrained_model_name_or_path,
+                      unet=accelerator.unwrap_model(unet).eval(),
+                  )
+                  pipeline = pipeline.to(accelerator.device)
+                  validation_ip_model = InferenceIPAdapter.from_existing(pipeline, image_encoder, image_proj_model, accelerator.device)
+
+                  videos = []
+                  validation_prompts = [args.prompt] * 4
+                  for validation_prompt in validation_prompts:
+                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
+                      output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=True)
+                      video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
+                      videos.append(video)
+
+                  for tracker in accelerator.trackers:
+                      if tracker.name == "wandb":
+                          tracker.log({
+                                  "step": global_step,
+                                  "validation-train": [
+                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=1)
+                                      for j, video in enumerate(videos)
+                                  ]
+                          })
+
+                  videos = []
+                  validation_prompts = [args.prompt] * 4
+                  for validation_prompt in validation_prompts:
+                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
+                      output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=False)
+                      video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
+                      videos.append(video)
+
+                  for tracker in accelerator.trackers:
+                      if tracker.name == "wandb":
+                          tracker.log({
+                                  "step": global_step,
+                                  "validation-test": [
+                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=8)
+                                      for j, video in enumerate(videos)
+                                  ]
+                          })
+
+                  del pipeline
+                  torch.cuda.empty_cache()
+
+            unet.train()
             with accelerator.accumulate(ip_adapter):
                 # Convert images to latent space
                 batch_size = 1 # FIXME
@@ -415,7 +476,12 @@ def main():
             
             if global_step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}.bin")
-                torch.save(accelerator.unwrap_model(ip_adapter).state_dict(), save_path) # TODO don't save unet tensors
+                state_dict = accelerator.unwrap_model(ip_adapter).state_dict()
+                adapter_state_dict = {
+                    key:tensor 
+                    for key, tensor in state_dict.items()
+                    if key.startswith("image_proj_model") or key.startswith("adapter_modules")}
+                torch.save(adapter_state_dict, save_path)
             
             begin = time.perf_counter()
                 

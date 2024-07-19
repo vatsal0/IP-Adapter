@@ -83,6 +83,20 @@ class IPAdapter:
 
         self.load_ip_adapter()
 
+    @classmethod
+    def from_existing(cls, pipe, image_encoder, image_proj_model, device, num_tokens=4):
+        self = IPAdapter.__new__(IPAdapter)
+
+        self.device = device
+        self.num_tokens = num_tokens
+        
+        self.pipe = pipe.to(self.device)
+        self.image_encoder = image_encoder.to(self.device)
+        self.clip_image_processor = CLIPImageProcessor()
+        self.image_proj_model = image_proj_model
+
+        return self
+
     def init_proj(self):
         image_proj_model = ImageProjModel(
             cross_attention_dim=self.pipe.unet.config.cross_attention_dim,
@@ -150,9 +164,9 @@ class IPAdapter:
             if isinstance(pil_image, Image.Image):
                 pil_image = [pil_image]
             clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
+            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.image_proj_model.proj.weight.dtype)).image_embeds.to(self.device, dtype=self.image_proj_model.proj.weight.dtype)
         else:
-            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=self.image_proj_model.proj.weight.dtype)
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
         uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
         return image_prompt_embeds, uncond_image_prompt_embeds
@@ -173,6 +187,7 @@ class IPAdapter:
         seed=None,
         guidance_scale=7.5,
         num_inference_steps=30,
+        bypass_all_temporal=False,
         **kwargs,
     ):
         self.set_scale(scale)
@@ -221,6 +236,7 @@ class IPAdapter:
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             generator=generator,
+            bypass_all_temporal=bypass_all_temporal,
             **kwargs,
         )
 
