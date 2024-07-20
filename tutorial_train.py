@@ -379,40 +379,32 @@ def main():
                   )
                   pipeline = pipeline.to(accelerator.device)
                   validation_ip_model = InferenceIPAdapter.from_existing(pipeline, image_encoder, image_proj_model, accelerator.device)
-
-                  videos = []
                   validation_prompts = [args.prompt] * 4
+
+                  train_videos = []
                   for validation_prompt in validation_prompts:
                       image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
                       output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=True)
                       video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
-                      videos.append(video)
+                      train_videos.append(video)
 
-                  for tracker in accelerator.trackers:
-                      if tracker.name == "wandb":
-                          tracker.log({
-                                  "step": global_step,
-                                  "validation-train": [
-                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=1)
-                                      for j, video in enumerate(videos)
-                                  ]
-                          })
-
-                  videos = []
-                  validation_prompts = [args.prompt] * 4
+                  test_videos = []
                   for validation_prompt in validation_prompts:
                       image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
                       output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=False)
                       video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
-                      videos.append(video)
+                      test_videos.append(video)
 
                   for tracker in accelerator.trackers:
                       if tracker.name == "wandb":
                           tracker.log({
-                                  "step": global_step,
+                                  "validation-train": [
+                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=1)
+                                      for j, video in enumerate(train_videos)
+                                  ],
                                   "validation-test": [
                                       wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=8)
-                                      for j, video in enumerate(videos)
+                                      for j, video in enumerate(test_videos)
                                   ]
                           })
 
