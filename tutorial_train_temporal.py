@@ -130,7 +130,13 @@ class IPAdapter(torch.nn.Module):
         orig_ip_proj_sum = torch.sum(torch.stack([torch.sum(p) for p in self.image_proj_model.parameters()]))
         orig_adapter_sum = torch.sum(torch.stack([torch.sum(p) for p in self.adapter_modules.parameters()]))
 
-        state_dict = torch.load(ckpt_path, map_location="cpu")
+        state_dict = {"image_proj": {}, "ip_adapter": {}}
+        f = torch.load(ckpt_path, map_location="cpu")
+        for key in f.keys():
+            if key.startswith("image_proj_model."):
+                state_dict["image_proj"][key.replace("image_proj_model.", "")] = f[key]
+            elif key.startswith("adapter_modules."):
+                state_dict["ip_adapter"][key.replace("adapter_modules.", "")] = f[key]
 
         # Load state dict for image_proj_model and adapter_modules
         self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
@@ -395,20 +401,6 @@ def main():
                       video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
                       test_videos.append(video)
 
-                  notext_videos = []
-                  for validation_prompt in validation_prompts:
-                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[int(random.random() * train_dataset.video.size(0))].permute(2,0,1)) 
-                      output = validation_ip_model.generate(prompt="", pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=False)
-                      video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
-                      notext_videos.append(video)
-
-                  noimg_videos = []
-                  for validation_prompt in validation_prompts:
-                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[int(random.random() * train_dataset.video.size(0))].permute(2,0,1)) 
-                      output = validation_ip_model.generate(prompt=validation_prompt, scale=0, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=False)
-                      video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
-                      noimg_videos.append(video)
-
                   for tracker in accelerator.trackers:
                       if tracker.name == "wandb":
                           tracker.log({
@@ -419,14 +411,6 @@ def main():
                                   "validation-test": [
                                       wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=8)
                                       for j, video in enumerate(test_videos)
-                                  ],
-                                  "validation-test-notext": [
-                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=8)
-                                      for j, video in enumerate(notext_videos)
-                                  ],
-                                  "validation-test-noimg": [
-                                      wandb.Video(video, caption=f"{j}: {validation_prompt}", fps=8)
-                                      for j, video in enumerate(noimg_videos)
                                   ]
                           })
 

@@ -1,3 +1,6 @@
 diffusers
 wandb/
 ip_adapter/__pycache__/
+scripts/
+results/
+*.out

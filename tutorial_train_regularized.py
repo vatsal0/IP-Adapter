@@ -383,14 +383,14 @@ def main():
 
                   train_videos = []
                   for validation_prompt in validation_prompts:
-                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
+                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[int(random.random() * train_dataset.video.size(0))].permute(2,0,1)) 
                       output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=True)
                       video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
                       train_videos.append(video)
 
                   test_videos = []
                   for validation_prompt in validation_prompts:
-                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[0].permute(2,0,1)) 
+                      image = torchvision.transforms.functional.to_pil_image(train_dataset.video[int(random.random() * train_dataset.video.size(0))].permute(2,0,1)) 
                       output = validation_ip_model.generate(prompt=validation_prompt, pil_image=image, num_samples=1, num_inference_steps=25, bypass_all_temporal=False)
                       video = np.stack([frame.transpose(2, 0, 1) for frame in output.frames])
                       test_videos.append(video)
@@ -456,7 +456,10 @@ def main():
             
                 with torch.no_grad():
                     image_embeds = image_encoder(batch["clip_images"].to(accelerator.device, dtype=weight_dtype)).image_embeds
-                    image_embeds = image_embeds.unsqueeze(0).mean(dim=1)
+                    image_embeds = image_embeds[int(random.random() * image_embeds.size(0))] # select random image embed instead of avg
+                    # image_embeds = image_embeds.unsqueeze(0).mean(dim=1)
+                if random.random() < 0.05:
+                    image_embeds = image_embeds * 0.
                 # image_embeds_ = []
                 # for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
                 #     if drop_image_embed == 1:
